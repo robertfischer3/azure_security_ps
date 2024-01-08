@@ -1,17 +1,21 @@
-# Ensuring Azure PowerShell module is installed
+# Check if Azure PowerShell module is installed, install it if not
 if (-not (Get-Module -ListAvailable -Name Az)) {
     Install-Module -Name Az -Scope CurrentUser -Repository PSGallery -Force
 }
 Import-Module Az
 
+# Connect to Azure account
 Connect-AzAccount
 
-$subscriptions = Get-AzSubscription
-$outputContent = [System.Collections.Concurrent.ConcurrentBag[Object]]::new()
+# Retrieve all Azure subscriptions
+$allSubscriptions = Get-AzSubscription
+# Initialize a concurrent collection to store output data
+$outputData = [System.Collections.Concurrent.ConcurrentBag[Object]]::new()
 
-$nullCount = 0
-$total_disk_number = 0
+# Counter for total disks
+$totalDiskCount = 0
 
+# Function to return the input object or a string 'Null' if the input is null
 function Get-ValueOrStringNull {
     param (
         [Parameter(Mandatory=$true)]
@@ -25,130 +29,89 @@ function Get-ValueOrStringNull {
     }
 }
 
-foreach ($subscription in $subscriptions) {
-
+# Iterate over each subscription
+foreach ($subscription in $allSubscriptions) {
+    # Set context to current subscription
     Set-AzContext -SubscriptionId $subscription.SubscriptionId
 
-    # Getting all VMs in the subscription
-    $getAllVMInSubscription = Get-AzVM
+    # Retrieve all VMs and disks in the subscription
+    $vmsInSubscription = Get-AzVM
+    $disksInSubscription = Get-AzDisk
+    $totalDiskCount += $disksInSubscription.Count
 
-    # Getting all disks in the subscription
-    $disks = Get-AzDisk
-    $total_disk_number += $disks.Count
+    # Initialize an array to store VM and disk information
+    $vmDiskInfoArray = @()
 
-    # Initialize the collection to store the results
-    $vmDiskCollection = @()
-
-    foreach ($vm in $getAllVMInSubscription) {
-        # Getting the VM details
+    foreach ($vm in $vmsInSubscription) {
+        # Retrieve details of each VM
         $vmDetails = Get-AzVM -ResourceGroupName $vm.ResourceGroupName -Name $vm.Name
         $encryptionStatus = Get-AzVMDiskEncryptionStatus -ResourceGroupName $vmDetails.ResourceGroupName -VMName $vmDetails.Name
 
-        #Find ADE extension version if ADE extension is installed                 
-        $vmExtensions = $vmDetails.Extensions
-        
-        $isVMADEEncrypted = $false
-        $extensionName = "Null"
+        # Initialize encryption status and extension name
+        $isVmEncrypted = $false
+        $vmExtensionName = "Null"
 
-        foreach ($extension in $vmExtensions) {
+        # Check for Azure Disk Encryption (ADE) extension
+        foreach ($extension in $vmDetails.Extensions) {
             if ($extension.Name -like "azurediskencryption*") {
-                $extensionName = $extension.Name
-                $isVMADEEncrypted = $true
+                $vmExtensionName = $extension.Name
+                $isVmEncrypted = $true
                 break;            
             }            
         }
 
-        # Check OS disk
-        $osDisk = $disks | Where-Object { $_.Id -eq $vmDetails.StorageProfile.OsDisk.ManagedDisk.Id }
+        # Check and record OS disk encryption status
+        $osDisk = $disksInSubscription | Where-Object { $_.Id -eq $vmDetails.StorageProfile.OsDisk.ManagedDisk.Id }
         if ($osDisk) {
-            
-            if ($null -eq $disk.EncryptionSettingsCollection.EncryptionSettings)
-            {
-                $encryptionTypeOs = "Null"
-            }
-            else {
-                $encryptionTypeOs = $disk.EncryptionSettingsCollection.EncryptionSettings
-
-            }
-
-            $recordOs = [PSCustomObject]@{
+            $encryptionTypeOsDisk = if ($null -eq $osDisk.EncryptionSettingsCollection.EncryptionSettings) { "Null" } else { $osDisk.EncryptionSettingsCollection.EncryptionSettings }
+            $osDiskRecord = [PSCustomObject]@{
                 Subscription       = $subscription.Name
                 VMName             = $vm.Name
-                ResourceGroup       = $vm.ResourceGroupName
-                VMExtension        = $extensionName
-                Encrypted          = $isVMADEEncrypted
+                ResourceGroup      = $vm.ResourceGroupName
+                VMExtension        = $vmExtensionName
+                Encrypted          = $isVmEncrypted
                 DiskEncryptionType = Get-ValueOrStringNull -InputObject $osDisk.Encryption.Type
                 DiskName           = Get-ValueOrStringNull -InputObject $osDisk.Name
                 StorageProfile     = "OS"
                 StorageEncryption  = Get-ValueOrStringNull -InputObject $encryptionStatus.OsVolumeEncrypted
-                EncryptionType     = if ($encryptionTypeOs -ne "Null" || $isVMADEEncrypted-eq $true) { "ADE" } else { "None or Other" }                
+                EncryptionType     = if ($encryptionTypeOsDisk -ne "Null" || $isVmEncrypted -eq $true) { "ADE" } else { "None or Other" }                
             }
-            Write-Host "Record: " $recordOs
-            if ($null -ne $recordOs) {
-                $outputContent.Add($recordOs)
-            }
-            else {
-                Write-Error "Null record issue: " $recordOs
-            }
-            $recordOs = $null
+            $outputData.Add($osDiskRecord)
         }
 
-        # Check data disks
+        # Check and record data disk encryption status
         foreach ($dataDisk in $vmDetails.StorageProfile.DataDisks) {
-            $disk = $disks | Where-Object { $_.Id -eq $dataDisk.ManagedDisk.Id }
+            $disk = $disksInSubscription | Where-Object { $_.Id -eq $dataDisk.ManagedDisk.Id }
             if ($disk) {
-
-                if ($null -eq $disk.EncryptionSettingsCollection.EncryptionSettings)
-                {
-                    $encryptionType = "Null"
-                }
-                else {
-                    $encryptionType = $disk.EncryptionSettingsCollection.EncryptionSettings
-    
-                }
-                
-                $recordData = [PSCustomObject]@{
+                $encryptionTypeDataDisk = if ($null -eq $disk.EncryptionSettingsCollection.EncryptionSettings) { "Null" } else { $disk.EncryptionSettingsCollection.EncryptionSettings }
+                $dataDiskRecord = [PSCustomObject]@{
                     Subscription       = $subscription.Name
                     VMName             = $vm.Name
                     ResourceGroup      = $vm.ResourceGroupName
-                    VMExtension        = $extensionName
-                    Encrypted          = $isVMADEEncrypted
+                    VMExtension        = $vmExtensionName
+                    Encrypted          = $isVmEncrypted
                     DiskEncryptionType = Get-ValueOrStringNull -InputObject $disk.Encryption.Type
                     DiskName           = Get-ValueOrStringNull -InputObject $disk.Name
                     StorageProfile     = "Data"
                     StorageEncryption  = Get-ValueOrStringNull -InputObject $encryptionStatus.DataVolumesEncrypted
-                    EncryptionType     = if ($encryptionType -ne "Null" || $isVMADEEncrypted-eq $true) { "ADE" } else { "None or Other" }
+                    EncryptionType     = if ($encryptionTypeDataDisk -ne "Null" || $isVmEncrypted -eq $true) { "ADE" } else { "None or Other" }
                 }
-                Write-Host "Record: " $recordData
-                if ($null -ne $recordData){
-                    $outputContent.Add($recordData)
-                }
-                else {
-                    Write-Host "Null record issue: " $recordData
-                }
-
-                $recordData = $null
+                $outputData.Add($dataDiskRecord)
             }
         }
     }
-
-    # Output the results
-    $vmDiskCollection | Format-Table -Property Subscription, VMName, EncryptionType, Encrypted, VMExtension, DiskEncryptionType, DiskName, StorageProfile, StorageEncryption
-
 }
 
-# Convert ConcurrentBag to array for export
-$outputArray = $outputContent.ToArray()
+# Convert ConcurrentBag data to an array for exporting
+$outputArray = $outputData.ToArray()
 
-# Get the current date and time
+# Get current date and time for filename
 $currentDateTime = Get-Date
-
-# Format the date and time in a file-friendly format (e.g., 'YYYYMMDD_HHMMSS')
 $dateTimeString = $currentDateTime.ToString("yyyyMMdd_HHmmss")
 
+# Export data to a CSV file
+$filePath = ".\Scan_" + $dateTimeString + "_AdeVMInfo.csv"
+$outputArray | Export-Csv -Path $filePath -NoTypeInformation
 
-#Write to output file
-$filePath = ".\" + "Scan_" + $dateTimeString + "_AdeVMInfo.csv"
-$outputArray | export-csv -Path $filePath -NoTypeInformation
-
-Write-Host "Total Record Count: " $outputContent.Count
+# Display total record count
+Write-Host "Total Record Count: " $outputData.Count
